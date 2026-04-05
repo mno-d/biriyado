@@ -1,0 +1,486 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>交代ビリヤード</title>
+<style>
+  :root{
+    --bg:#08131f;
+    --panel:rgba(10,20,32,.84);
+    --line:rgba(255,255,255,.12);
+    --text:#eef7ff;
+    --muted:#b8c7d8;
+    --accent:#8fd8ff;
+    --good:#88f2b5;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;width:100%;height:100%;overflow:hidden;font-family:"Segoe UI","Hiragino Sans","Yu Gothic UI",sans-serif;background:radial-gradient(circle at top,#193555,#08131f 55%,#050b12 100%);color:var(--text)}
+  .app{width:100%;height:100%;display:grid;grid-template-rows:auto 1fr;gap:10px;padding:10px}
+  .hud{display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:10px 14px;backdrop-filter:blur(10px)}
+  .big{font-size:22px;font-weight:800;margin-right:8px}
+  .chip{padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);font-weight:700}
+  .muted{color:var(--muted);font-size:14px}
+  .spacer{flex:1}
+  button{border:0;border-radius:12px;padding:10px 14px;background:var(--accent);color:#062236;font-weight:800;cursor:pointer}
+  button.alt{background:rgba(255,255,255,.08);color:var(--text);border:1px solid rgba(255,255,255,.1)}
+  .tableWrap{position:relative;min-height:0;background:var(--panel);border:1px solid var(--line);border-radius:22px;overflow:hidden}
+  canvas{width:100%;height:100%;display:block;touch-action:none}
+  .toast{position:absolute;left:50%;top:18px;transform:translateX(-50%);background:rgba(4,10,18,.85);border:1px solid rgba(255,255,255,.12);padding:10px 16px;border-radius:999px;font-weight:700;pointer-events:none;opacity:0;transition:.18s}
+  .toast.show{opacity:1}
+  @media (max-width:900px){
+    .big{font-size:19px}
+    .muted{font-size:13px}
+    .hud{padding:10px}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="hud">
+    <div class="big">交代ビリヤード</div>
+    <div class="chip" id="turnChip">P1 の番</div>
+    <div class="chip" id="scoreChip">P1 0 - 0 P2</div>
+    <div class="muted" id="infoText">白球をひっぱって離す</div>
+    <div class="spacer"></div>
+    <button class="alt" id="resetBtn">最初から</button>
+  </div>
+  <div class="tableWrap">
+    <canvas id="game"></canvas>
+    <div class="toast" id="toast"></div>
+  </div>
+</div>
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const turnChip = document.getElementById('turnChip');
+  const scoreChip = document.getElementById('scoreChip');
+  const infoText = document.getElementById('infoText');
+  const toastEl = document.getElementById('toast');
+  const resetBtn = document.getElementById('resetBtn');
+
+  const W = 1200;
+  const H = 700;
+  const table = { x: 90, y: 70, w: 1020, h: 560, rail: 28 };
+  const BALL_R = 14;
+  const POCKET_R = 31;
+  const FRICTION = 0.992;
+  const STOP_SPEED = 0.035;
+  const MAX_PULL = 150;
+  const POWER = 0.12;
+  const RESTITUTION = 0.98;
+
+  const colors = [
+    '#f5c542','#4776ff','#ff5252','#8b5cf6','#ff8b3d',
+    '#45d48a','#ff6baa','#58d4ff','#f4e66a','#9aa7b8'
+  ];
+
+  let state;
+  let dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+  let toastTimer = 0;
+
+  function showToast(text){
+    toastEl.textContent = text;
+    toastEl.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.classList.remove('show'), 1200);
+  }
+
+  function resize(){
+    const rect = canvas.getBoundingClientRect();
+    dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = Math.round(rect.width * dpr);
+    canvas.height = Math.round(rect.height * dpr);
+  }
+
+  function makeBall(x, y, color, label, cue = false){
+    return { x, y, vx:0, vy:0, r:BALL_R, color, label, cue, alive:true };
+  }
+
+  function setupBalls(){
+    const balls = [];
+    const cueStart = { x: table.x + table.w * 0.25, y: table.y + table.h * 0.5 };
+    balls.push(makeBall(cueStart.x, cueStart.y, '#ffffff', '', true));
+
+    const startX = table.x + table.w * 0.72;
+    const startY = table.y + table.h * 0.5;
+    let n = 0;
+    for(let row = 0; row < 4; row++){
+      for(let i = 0; i <= row; i++){
+        if (n >= colors.length) break;
+        const x = startX + row * (BALL_R * 2 * 0.92);
+        const y = startY + (i - row / 2) * (BALL_R * 2.1);
+        balls.push(makeBall(x, y, colors[n], String(n + 1), false));
+        n++;
+      }
+    }
+    return balls;
+  }
+
+  function resetGame(){
+    state = {
+      balls: setupBalls(),
+      currentPlayer: 0,
+      scores: [0,0],
+      dragging: false,
+      pointer: {x:0,y:0},
+      shotActive: false,
+      pocketedThisShot: 0,
+      cuePocketed: false,
+      winner: null
+    };
+    updateHud();
+    infoText.textContent = '白球をひっぱって離す';
+  }
+
+  function cueBall(){ return state.balls[0]; }
+  function objectBallsLeft(){ return state.balls.slice(1).filter(b => b.alive).length; }
+  function moving(){ return state.balls.some(b => b.alive && (Math.abs(b.vx) > STOP_SPEED || Math.abs(b.vy) > STOP_SPEED)); }
+
+  function updateHud(){
+    turnChip.textContent = state.winner == null ? `P${state.currentPlayer + 1} の番` : state.winner;
+    scoreChip.textContent = `P1 ${state.scores[0]} - ${state.scores[1]} P2`;
+  }
+
+  function pockets(){
+    const x0 = table.x, x1 = table.x + table.w, y0 = table.y, y1 = table.y + table.h, mx = table.x + table.w / 2;
+    return [
+      {x:x0,y:y0},{x:mx,y:y0},{x:x1,y:y0},
+      {x:x0,y:y1},{x:mx,y:y1},{x:x1,y:y1}
+    ];
+  }
+
+  function screenToWorld(clientX, clientY){
+    const rect = canvas.getBoundingClientRect();
+    const sx = (clientX - rect.left) / rect.width;
+    const sy = (clientY - rect.top) / rect.height;
+    return { x: sx * W, y: sy * H };
+  }
+
+  function canShoot(){
+    const c = cueBall();
+    return state.winner == null && !state.shotActive && !moving() && c.alive;
+  }
+
+  function beginDrag(x, y){
+    const c = cueBall();
+    if (!canShoot()) return;
+    const dx = x - c.x;
+    const dy = y - c.y;
+    if (Math.hypot(dx, dy) <= c.r + 16){
+      state.dragging = true;
+      state.pointer.x = x;
+      state.pointer.y = y;
+    }
+  }
+
+  function moveDrag(x, y){
+    if (!state.dragging) return;
+    state.pointer.x = x;
+    state.pointer.y = y;
+  }
+
+  function endDrag(){
+    if (!state.dragging) return;
+    state.dragging = false;
+    const c = cueBall();
+    const dx = state.pointer.x - c.x;
+    const dy = state.pointer.y - c.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 8) return;
+    const pull = Math.min(MAX_PULL, len);
+    const nx = dx / len;
+    const ny = dy / len;
+    c.vx = -nx * pull * POWER;
+    c.vy = -ny * pull * POWER;
+    state.shotActive = true;
+    state.pocketedThisShot = 0;
+    state.cuePocketed = false;
+    infoText.textContent = '球が止まるまで待つ';
+  }
+
+  function clampBallToTable(ball){
+    const left = table.x + ball.r;
+    const right = table.x + table.w - ball.r;
+    const top = table.y + ball.r;
+    const bottom = table.y + table.h - ball.r;
+    if (ball.x < left){ ball.x = left; ball.vx *= -RESTITUTION; }
+    if (ball.x > right){ ball.x = right; ball.vx *= -RESTITUTION; }
+    if (ball.y < top){ ball.y = top; ball.vy *= -RESTITUTION; }
+    if (ball.y > bottom){ ball.y = bottom; ball.vy *= -RESTITUTION; }
+  }
+
+  function resolveBallCollision(a,b){
+    if (!a.alive || !b.alive) return;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.hypot(dx, dy);
+    const minDist = a.r + b.r;
+    if (!dist || dist >= minDist) return;
+
+    const nx = dx / dist;
+    const ny = dy / dist;
+    const overlap = minDist - dist;
+    a.x -= nx * overlap * 0.5;
+    a.y -= ny * overlap * 0.5;
+    b.x += nx * overlap * 0.5;
+    b.y += ny * overlap * 0.5;
+
+    const rvx = b.vx - a.vx;
+    const rvy = b.vy - a.vy;
+    const velAlongNormal = rvx * nx + rvy * ny;
+    if (velAlongNormal > 0) return;
+
+    const j = -(1 + RESTITUTION) * velAlongNormal / 2;
+    const ix = j * nx;
+    const iy = j * ny;
+    a.vx -= ix;
+    a.vy -= iy;
+    b.vx += ix;
+    b.vy += iy;
+  }
+
+  function checkPockets(){
+    for (const ball of state.balls){
+      if (!ball.alive) continue;
+      for (const p of pockets()){
+        const d = Math.hypot(ball.x - p.x, ball.y - p.y);
+        if (d < POCKET_R - 3){
+          ball.alive = false;
+          ball.vx = 0;
+          ball.vy = 0;
+          if (ball.cue){
+            state.cuePocketed = true;
+          } else {
+            state.pocketedThisShot += 1;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  function respawnCue(){
+    const c = cueBall();
+    c.alive = true;
+    c.x = table.x + table.w * 0.25;
+    c.y = table.y + table.h * 0.5;
+    c.vx = 0;
+    c.vy = 0;
+    let tries = 0;
+    while (tries < 200){
+      let ok = true;
+      for (const b of state.balls.slice(1)){
+        if (!b.alive) continue;
+        if (Math.hypot(c.x - b.x, c.y - b.y) < c.r + b.r + 4){ ok = false; break; }
+      }
+      if (ok) return;
+      c.x -= 6;
+      tries++;
+    }
+  }
+
+  function finishShot(){
+    state.shotActive = false;
+    state.scores[state.currentPlayer] += state.pocketedThisShot;
+    if (state.cuePocketed) respawnCue();
+
+    if (objectBallsLeft() === 0){
+      if (state.scores[0] > state.scores[1]) state.winner = 'P1 勝ち';
+      else if (state.scores[1] > state.scores[0]) state.winner = 'P2 勝ち';
+      else state.winner = '引き分け';
+      updateHud();
+      infoText.textContent = '最初から で再開';
+      showToast(state.winner);
+      return;
+    }
+
+    const gained = state.pocketedThisShot;
+    const cueMiss = state.cuePocketed;
+    state.currentPlayer = 1 - state.currentPlayer;
+    updateHud();
+    if (cueMiss) showToast(`白球が落ちた → P${state.currentPlayer + 1}`);
+    else if (gained > 0) showToast(`${gained} 球で P${state.currentPlayer + 1}`);
+    else showToast(`P${state.currentPlayer + 1} の番`);
+    infoText.textContent = '白球をひっぱって離す';
+  }
+
+  function update(dt){
+    for (const ball of state.balls){
+      if (!ball.alive) continue;
+      ball.x += ball.vx * dt * 60;
+      ball.y += ball.vy * dt * 60;
+      ball.vx *= Math.pow(FRICTION, dt * 60);
+      ball.vy *= Math.pow(FRICTION, dt * 60);
+      if (Math.abs(ball.vx) < STOP_SPEED) ball.vx = 0;
+      if (Math.abs(ball.vy) < STOP_SPEED) ball.vy = 0;
+      clampBallToTable(ball);
+    }
+
+    for (let k = 0; k < 2; k++){
+      for (let i = 0; i < state.balls.length; i++){
+        for (let j = i + 1; j < state.balls.length; j++){
+          resolveBallCollision(state.balls[i], state.balls[j]);
+        }
+      }
+    }
+
+    checkPockets();
+
+    if (state.shotActive && !moving()) finishShot();
+  }
+
+  function drawTable(){
+    ctx.clearRect(0,0,W,H);
+    ctx.fillStyle = '#3a2414';
+    roundRect(40, 20, W - 80, H - 40, 34);
+    ctx.fill();
+
+    ctx.fillStyle = '#0f5e3e';
+    roundRect(table.x - table.rail, table.y - table.rail, table.w + table.rail * 2, table.h + table.rail * 2, 24);
+    ctx.fill();
+
+    ctx.fillStyle = '#1b8a5b';
+    roundRect(table.x, table.y, table.w, table.h, 18);
+    ctx.fill();
+
+    ctx.strokeStyle = 'rgba(255,255,255,.14)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(table.x + 1, table.y + 1, table.w - 2, table.h - 2);
+
+    ctx.strokeStyle = 'rgba(255,255,255,.18)';
+    ctx.beginPath();
+    const headX = table.x + table.w * 0.25;
+    ctx.moveTo(headX, table.y + 14);
+    ctx.lineTo(headX, table.y + table.h - 14);
+    ctx.stroke();
+
+    for (const p of pockets()){
+      ctx.fillStyle = '#091016';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, POCKET_R, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawBalls(){
+    for (const ball of state.balls){
+      if (!ball.alive) continue;
+      const g = ctx.createRadialGradient(ball.x - ball.r * .3, ball.y - ball.r * .35, ball.r * .2, ball.x, ball.y, ball.r * 1.15);
+      g.addColorStop(0, '#ffffff');
+      g.addColorStop(0.18, ball.cue ? '#ffffff' : ball.color);
+      g.addColorStop(1, ball.cue ? '#dfe8f0' : shade(ball.color, -28));
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(ball.x, ball.y, ball.r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,.35)';
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+
+      if (!ball.cue){
+        ctx.fillStyle = 'rgba(255,255,255,.95)';
+        ctx.beginPath();
+        ctx.arc(ball.x, ball.y, ball.r * 0.46, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#183046';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(ball.label, ball.x, ball.y + 0.5);
+      }
+    }
+  }
+
+  function drawAim(){
+    if (!state.dragging || !canShoot()) return;
+    const c = cueBall();
+    const dx = state.pointer.x - c.x;
+    const dy = state.pointer.y - c.y;
+    const len = Math.hypot(dx, dy);
+    if (!len) return;
+    const pull = Math.min(MAX_PULL, len);
+    const nx = dx / len;
+    const ny = dy / len;
+
+    ctx.save();
+    ctx.setLineDash([10,8]);
+    ctx.strokeStyle = 'rgba(255,255,255,.72)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(c.x, c.y);
+    ctx.lineTo(c.x - nx * (140 + pull * 0.4), c.y - ny * (140 + pull * 0.4));
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.strokeStyle = 'rgba(143,216,255,.85)';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(c.x, c.y);
+    ctx.lineTo(c.x + nx * pull, c.y + ny * pull);
+    ctx.stroke();
+
+    ctx.fillStyle = 'rgba(255,255,255,.8)';
+    ctx.font = 'bold 16px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`Power ${Math.round((pull / MAX_PULL) * 100)}%`, table.x + 12, table.y + 24);
+  }
+
+  function draw(){
+    ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+    drawTable();
+    drawAim();
+    drawBalls();
+  }
+
+  function roundRect(x, y, w, h, r){
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function shade(hex, amt){
+    const n = parseInt(hex.slice(1), 16);
+    let r = (n >> 16) + amt;
+    let g = ((n >> 8) & 255) + amt;
+    let b = (n & 255) + amt;
+    r = Math.max(0, Math.min(255, r));
+    g = Math.max(0, Math.min(255, g));
+    b = Math.max(0, Math.min(255, b));
+    return `rgb(${r},${g},${b})`;
+  }
+
+  canvas.addEventListener('pointerdown', e => {
+    const p = screenToWorld(e.clientX, e.clientY);
+    beginDrag(p.x, p.y);
+  });
+  window.addEventListener('pointermove', e => {
+    const p = screenToWorld(e.clientX, e.clientY);
+    moveDrag(p.x, p.y);
+  });
+  window.addEventListener('pointerup', endDrag);
+  window.addEventListener('pointercancel', endDrag);
+  resetBtn.addEventListener('click', () => { resetGame(); showToast('リセット'); });
+  window.addEventListener('resize', resize);
+
+  let last = performance.now();
+  function frame(now){
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    update(dt);
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  resetGame();
+  resize();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
